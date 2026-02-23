@@ -41,15 +41,27 @@ def _get_cudart():
     global _cudart
     if _cudart is None:
         torch_dir = os.path.dirname(torch.__file__)
-        lib_dir = os.path.join(torch_dir, "lib")
+        site_packages = os.path.dirname(torch_dir)
+
+        candidates = [
+            os.path.join(torch_dir, "lib"),
+            os.path.join(site_packages, "nvidia", "cuda_runtime", "bin"),
+        ]
+
         cudart_path = None
-        if os.path.exists(lib_dir):
+        for lib_dir in candidates:
+            if not os.path.exists(lib_dir):
+                continue
             for f in os.listdir(lib_dir):
                 if f.startswith("cudart64") and f.endswith(".dll"):
                     cudart_path = os.path.join(lib_dir, f)
                     break
+            if cudart_path:
+                break
+
         if not cudart_path:
-            raise RuntimeError("Could not find cudart64_*.dll in torch/lib")
+            raise RuntimeError("Could not find cudart64_*.dll in torch/lib or nvidia/cuda_runtime/bin")
+
         _cudart = ctypes.WinDLL(cudart_path)
 
         # API Definitions
