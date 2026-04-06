@@ -65,7 +65,11 @@ def _get_cudart():
         _cudart = ctypes.WinDLL(cudart_path)
 
         # API Definitions
-        _cudart.cudaGraphicsD3D11RegisterResource.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+        _cudart.cudaGraphicsD3D11RegisterResource.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
         _cudart.cudaGraphicsUnregisterResource.argtypes = [ctypes.c_void_p]
         _cudart.cudaGraphicsMapResources.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
         _cudart.cudaGraphicsUnmapResources.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
@@ -84,6 +88,17 @@ def _get_cudart():
             ctypes.c_size_t,
             ctypes.c_size_t,
             ctypes.c_int,
+        ]
+        _cudart.cudaMemcpy2DFromArrayAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
         ]
         _cudart.cudaSetDevice.argtypes = [ctypes.c_int]
     return _cudart
@@ -131,21 +146,36 @@ class _DX11ToPyTorchBridge:
         res = self.cudart.cudaGraphicsD3D11RegisterResource(ctypes.byref(self.resource), texture_ptr, 0)
         if res != 0:
             raise RuntimeError(f"cudaGraphicsD3D11RegisterResource failed: {res}")
-        self.torch_tensor = torch.empty((height, width, 4), dtype=torch.uint8, device=f"cuda:{device_id}")
 
-    def update(self):
-        res = self.cudart.cudaGraphicsMapResources(1, ctypes.byref(self.resource), None)
+    def update(self, stream, device_id):
+        """Copies from DX11 texture to a new PyTorch tensor using a dedicated stream."""
+        target_tensor = torch.empty((self.height, self.width, 4), dtype=torch.uint8, device=f"cuda:{device_id}")
+
+        h_stream = ctypes.c_void_p(stream.cuda_stream)
+        res = self.cudart.cudaGraphicsMapResources(1, ctypes.byref(self.resource), h_stream)
         if res != 0:
             return None
         try:
             cu_array = ctypes.c_void_p()
             self.cudart.cudaGraphicsSubResourceGetMappedArray(ctypes.byref(cu_array), self.resource, 0, 0)
-            self.cudart.cudaMemcpy2DFromArray(
-                self.torch_tensor.data_ptr(), self.width * 4, cu_array, 0, 0, self.width * 4, self.height, 3
+            # Use Async version to respect the dedicated stream
+            self.cudart.cudaMemcpy2DFromArrayAsync(
+                target_tensor.data_ptr(),
+                self.width * 4,
+                cu_array,
+                0,
+                0,
+                self.width * 4,
+                self.height,
+                3,  # cudaMemcpyDeviceToDevice
+                h_stream,
             )
+            # Synchronize ONLY the dedicated stream to ensure the copy is finished before returning
+            stream.synchronize()
         finally:
-            self.cudart.cudaGraphicsUnmapResources(1, ctypes.byref(self.resource), None)
-        return self.torch_tensor
+            self.cudart.cudaGraphicsUnmapResources(1, ctypes.byref(self.resource), h_stream)
+
+        return target_tensor
 
     def __del__(self):
         if hasattr(self, "resource") and self.resource:
@@ -186,6 +216,7 @@ class WindowsCapture:
         self._loop_thread = None
         self._control = InternalCaptureControl(self)
         self._last_id = 0
+        self._stream = None
 
     def event(self, handler):
         if handler.__name__ == "on_frame_arrived":
@@ -198,6 +229,9 @@ class WindowsCapture:
         """Starts the capture and blocks (emulating windows-capture behavior)."""
         if not self.frame_handler:
             raise Exception("on_frame_arrived handler not set")
+
+        # Initialize a dedicated stream for this capture session
+        self._stream = torch.cuda.Stream(device=self.device_id)
 
         self._inner.start()
         self._running = True
@@ -224,7 +258,8 @@ class WindowsCapture:
                     if self._bridge is None or self._bridge.width != w or self._bridge.height != h:
                         self._bridge = _DX11ToPyTorchBridge(gpu_frame.texture_ptr, w, h, self.device_id)
 
-                    tensor = self._bridge.update()
+                    # Update returns a fresh, synchronized tensor
+                    tensor = self._bridge.update(self._stream, self.device_id)
                     if tensor is not None:
                         # Slice the tensor to original size to remove alignment padding
                         sliced_tensor = tensor[:oh, :ow]
