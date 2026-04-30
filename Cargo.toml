@@ -1,10 +1,10 @@
 [package]
-name = "wc_cuda"
+name = "wc_rocm"
 version = "0.1.2"
 edition = "2024"
 
 [lib]
-name = "_wc_cuda"
+name = "_wc_rocm"
 crate-type = ["cdylib"]
 
 [dependencies]

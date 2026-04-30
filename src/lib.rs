@@ -121,6 +121,24 @@ impl WcGpuFrame {
     fn texture_ptr(&self) -> usize {
         self.texture.as_raw() as usize
     }
+
+    /// Win32 shared handle (HANDLE) obtained via IDXGIResource::GetSharedHandle.
+    /// Returns 0 if the texture does not have the SHARED misc flag.
+    #[getter]
+    fn shared_handle(&self) -> usize {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::IDXGIResource;
+        unsafe {
+            let dxgi_res: IDXGIResource = match self.texture.cast() {
+                Ok(r) => r,
+                Err(_) => return 0,
+            };
+            match dxgi_res.GetSharedHandle() {
+                Ok(h) => h.0 as usize,
+                Err(_) => 0,
+            }
+        }
+    }
 }
 
 struct FrameSlot {
@@ -417,7 +435,7 @@ impl WcCapture {
 }
 
 #[pymodule]
-fn _wc_cuda(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _wc_rocm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WcCapture>()?;
     m.add_class::<WcGpuFrame>()?;
     Ok(())
