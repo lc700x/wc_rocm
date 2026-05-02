@@ -362,8 +362,9 @@ class WindowsCapture:
         )
         self.frame_handler  = None
         self.closed_handler = None
-        self._bridge: Optional[_HipD3D11Bridge] = None
-        self._running       = False
+        self._bridges: list  = [None, None]
+        self._last_wh: tuple = (0, 0)
+        self._running        = False
         self._loop_thread   = None
         self._control       = InternalCaptureControl(self)
         self._last_id       = 0
@@ -381,10 +382,12 @@ class WindowsCapture:
         if not self.frame_handler:
             raise RuntimeError("on_frame_arrived handler not set")
 
-        self._stream  = torch.cuda.Stream(device=self.device_id)
+        self._stream   = torch.cuda.Stream(device=self.device_id)
         self._inner.start()
-        self._running = True
-        self._last_id = 0
+        self._running  = True
+        self._last_id  = 0
+        self._bridges  = [None, None]
+        self._last_wh  = (0, 0)
 
         t0 = time.time()
         while not self._inner.is_alive() and time.time() - t0 < 1.0:
@@ -406,13 +409,22 @@ class WindowsCapture:
 
                 gpu_frame, new_id = res
                 self._last_id = new_id
-                w, h   = gpu_frame.width,         gpu_frame.height
-                ow, oh = gpu_frame.original_width, gpu_frame.original_height
+                w, h    = gpu_frame.width,         gpu_frame.height
+                ow, oh  = gpu_frame.original_width, gpu_frame.original_height
+                buf_idx = gpu_frame.buf_idx  # 0 or 1, set by Rust ping-pong
 
-                if self._bridge is None or self._bridge.width != w or self._bridge.height != h:
-                    self._bridge = _HipD3D11Bridge(gpu_frame.shared_handle, w, h, self.device_id)
+                # Drop both bridges on resolution change; Rust recreated both textures
+                # with new KMT handles so the old imported handles are stale.
+                if (w, h) != self._last_wh:
+                    self._bridges = [None, None]
+                    self._last_wh = (w, h)
 
-                tensor = self._bridge.update(self._stream, self.device_id)
+                if self._bridges[buf_idx] is None:
+                    self._bridges[buf_idx] = _HipD3D11Bridge(
+                        gpu_frame.shared_handle, w, h, self.device_id
+                    )
+
+                tensor = self._bridges[buf_idx].update(self._stream, self.device_id)
                 self.frame_handler(Frame(tensor[:oh, :ow], ow, oh), self._control)
 
         finally:

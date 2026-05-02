@@ -6,4 +6,4 @@ To avoid reinstalling torch, it's not listed as a dependency, but a ROCm7-enable
 
 # AI generated
 
-This was written by claude code.
+This was written by **Claude Code**. 
