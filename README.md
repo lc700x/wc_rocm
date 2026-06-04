@@ -44,4 +44,4 @@ When buffer reuse is enabled, tensors may be overwritten after several frames (r
 
 ## AI generated
 
-This was written by gemini-cli.
+This was written by gemini-cli and claude code.
