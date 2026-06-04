@@ -9,10 +9,9 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Foundation::{LPARAM, LUID, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_QUERY_DESC,
-    D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Asynchronous, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -114,8 +113,6 @@ pub struct WcGpuFrame {
     pub original_width: u32,
     #[pyo3(get)]
     pub original_height: u32,
-    #[pyo3(get)]
-    pub buf_idx: usize,
 }
 
 #[pymethods]
@@ -123,24 +120,6 @@ impl WcGpuFrame {
     #[getter]
     fn texture_ptr(&self) -> usize {
         self.texture.as_raw() as usize
-    }
-
-    /// Win32 shared handle (HANDLE) obtained via IDXGIResource::GetSharedHandle.
-    /// Returns 0 if the texture does not have the SHARED misc flag.
-    #[getter]
-    fn shared_handle(&self) -> usize {
-        use windows::core::Interface;
-        use windows::Win32::Graphics::Dxgi::IDXGIResource;
-        unsafe {
-            let dxgi_res: IDXGIResource = match self.texture.cast() {
-                Ok(r) => r,
-                Err(_) => return 0,
-            };
-            match dxgi_res.GetSharedHandle() {
-                Ok(h) => h.0 as usize,
-                Err(_) => 0,
-            }
-        }
     }
 }
 
@@ -151,9 +130,7 @@ struct FrameSlot {
 
 struct InnerHandler {
     shared_slot: Arc<FrameSlot>,
-    event_query: ID3D11Query,
-    shared_textures: [Option<ID3D11Texture2D>; 2],
-    write_idx: usize,
+    shared_texture: Option<ID3D11Texture2D>,
     current_aligned_width: u32,
     current_aligned_height: u32,
     thread_id: u32,
@@ -164,15 +141,10 @@ impl GraphicsCaptureApiHandler for InnerHandler {
     type Error = WcCudaError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let query_desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
-        let mut query: Option<ID3D11Query> = None;
-        unsafe { ctx.device.CreateQuery(&query_desc, Some(&mut query))? };
         Ok(Self {
             shared_slot: ctx.flags.0,
             thread_id: ctx.flags.1,
-            event_query: query.unwrap(),
-            shared_textures: [None, None],
-            write_idx: 0,
+            shared_texture: None,
             current_aligned_width: 0,
             current_aligned_height: 0,
         })
@@ -192,7 +164,7 @@ impl GraphicsCaptureApiHandler for InnerHandler {
         let aligned_width = (width + 63) & !63;
         let aligned_height = (height + 31) & !31;
 
-        let recreate = self.shared_textures[0].is_none()
+        let recreate = self.shared_texture.is_none()
             || self.current_aligned_width != aligned_width
             || self.current_aligned_height != aligned_height;
 
@@ -212,71 +184,34 @@ impl GraphicsCaptureApiHandler for InnerHandler {
                 CPUAccessFlags: 0,
                 MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
             };
-            for slot in &mut self.shared_textures {
-                let mut tex = None;
-                unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex))? };
-                *slot = Some(tex.unwrap());
-            }
+            let mut tex = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex))? };
+            self.shared_texture = Some(tex.unwrap());
             self.current_aligned_width = aligned_width;
             self.current_aligned_height = aligned_height;
-            self.write_idx = 0;
         }
 
-        if let Some(ref tex) = self.shared_textures[self.write_idx] {
-            let tex = tex.clone();
+        if let Some(ref tex) = self.shared_texture {
             unsafe {
-                context.CopySubresourceRegion(&tex, 0, 0, 0, 0, frame.as_raw_texture(), 0, None);
+                context.CopySubresourceRegion(tex, 0, 0, 0, 0, frame.as_raw_texture(), 0, None);
+                // Flush is a non-blocking submit: it pushes the copy into the GPU
+                // queue so the shared texture is visible to the CUDA interop map.
+                // It does NOT stall the CPU, so it is not an FPS bottleneck.
                 context.Flush();
             }
-
-            // Race 1 fix: wait for GPU to finish the copy before signaling Python.
-            // Flush() only submits — without this fence Python's HIP DMA can read
-            // a partially-written texture.
-            let async_query: ID3D11Asynchronous = self.event_query.cast()?;
-            unsafe { context.End(&async_query); }
-            // GetData's safe wrapper returns Result<()> and folds S_FALSE into Ok(()),
-            // so call the vtable directly to distinguish "done" (S_OK=0) from
-            // "not yet" (S_FALSE=1).
-            // ID3D11Asynchronous vtable: QI=0, AddRef=1, Release=2, GetDevice=3,
-            // GetPrivateData=4, SetPrivateData=5, SetPrivateDataInterface=6,
-            // GetType=7, Begin=8, End=9, GetData=10, SetPredication=11.
-            // GetData's safe wrapper returns Result<()> and folds S_FALSE into Ok(()),
-            // so we detect completion via the output value: for D3D11_QUERY_EVENT,
-            // the GPU writes 0 (not done) or 1 (done) into the BOOL output.
-            let mut done: u32 = 0;
-            loop {
-                let _ = unsafe {
-                    context.GetData(
-                        &async_query,
-                        Some((&mut done as *mut u32).cast()),
-                        4,
-                        1, // D3D11_ASYNC_GETDATA_DONOTFLUSH — already flushed above
-                    )
-                };
-                if done != 0 {
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-
-            let buf_idx = self.write_idx;
             let gpu_frame = WcGpuFrame {
-                texture: tex,
+                texture: tex.clone(),
                 width: aligned_width,
                 height: aligned_height,
                 original_width: width,
                 original_height: height,
-                buf_idx,
             };
-
+            
+            // Update the shared slot with the latest frame
             let mut data = self.shared_slot.data.lock();
             data.0 = Some(gpu_frame);
             data.1 += 1;
-            self.shared_slot.condvar.notify_all();
-
-            // Race 2 fix: advance write_idx AFTER signaling so the next frame
-            // writes into the other texture while Python reads this one.
-            self.write_idx = 1 - self.write_idx;
+            self.shared_slot.condvar.notify_one();
         }
         Ok(())
     }
@@ -348,12 +283,12 @@ impl WcCapture {
         let last_error = self.last_error.clone();
         let shared_slot = self.shared_slot.clone();
 
-        should_stop.store(false, Ordering::SeqCst);
+    should_stop.store(false, Ordering::Relaxed);
         *last_error.lock() = None;
 
         let handle = thread::spawn(move || {
             let res: Result<(), WcCudaError> = (|| {
-                if should_stop.load(Ordering::SeqCst) {
+                if should_stop.load(Ordering::Relaxed) {
                     return Ok(());
                 }
 
@@ -385,7 +320,7 @@ impl WcCapture {
                 let tid = unsafe { GetCurrentThreadId() };
                 *thread_id_ptr.lock() = Some(tid);
 
-                if should_stop.load(Ordering::SeqCst) {
+                if should_stop.load(Ordering::Relaxed) {
                     return Ok(());
                 }
 
@@ -438,7 +373,7 @@ impl WcCapture {
     }
 
     fn stop(&self) {
-        self.should_stop.store(true, Ordering::SeqCst);
+    self.should_stop.store(true, Ordering::Relaxed);
         if let Some(tid) = *self.thread_id.lock() {
             unsafe {
                 let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
@@ -471,7 +406,7 @@ impl WcCapture {
         py.allow_threads(move || {
             let mut data = slot.data.lock();
             if data.1 <= last_id && timeout.is_some() {
-                let dur = Duration::from_secs_f32(timeout.unwrap());
+                let dur = Duration::from_secs_f32(timeout.unwrap_or(0.0));
                 let _ = slot.condvar.wait_for(&mut data, dur);
             }
             
@@ -485,7 +420,7 @@ impl WcCapture {
 }
 
 #[pymodule]
-fn _wc_rocm(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _wc_cuda(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WcCapture>()?;
     m.add_class::<WcGpuFrame>()?;
     Ok(())

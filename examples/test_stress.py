@@ -1,5 +1,5 @@
 import time
-from wc_rocm import WindowsCapture
+from wc_cuda import WindowsCapture
 
 
 def test_stress_restart():

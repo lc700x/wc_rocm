@@ -3,11 +3,11 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "wc_rocm"
+name = "wc_cuda"
 dynamic = ["version"]
 dependencies = []
 requires-python = ">=3.10"
 
 [tool.maturin]
 python-source = "python"
-module-name = "wc_rocm._wc_rocm"
+module-name = "wc_cuda._wc_cuda"
