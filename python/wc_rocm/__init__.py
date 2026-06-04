@@ -163,6 +163,26 @@ def _get_hip():
         ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
         ctypes.c_int, ctypes.c_void_p,
     ]
+    # External-semaphore interop (GPU-to-GPU fence). Present on ROCm 7+.
+    for _name in ("hipImportExternalSemaphore", "hipWaitExternalSemaphoresAsync",
+                  "hipDestroyExternalSemaphore"):
+        if not hasattr(lib, _name):
+            break
+    else:
+        lib.hipImportExternalSemaphore.restype            = ctypes.c_int
+        lib.hipImportExternalSemaphore.argtypes           = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+        ]
+        lib.hipWaitExternalSemaphoresAsync.restype        = ctypes.c_int
+        lib.hipWaitExternalSemaphoresAsync.argtypes       = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_void_p,
+        ]
+        lib.hipDestroyExternalSemaphore.restype           = ctypes.c_int
+        lib.hipDestroyExternalSemaphore.argtypes          = [ctypes.c_void_p]
+    if hasattr(lib, "hipGetLastError"):
+        lib.hipGetLastError.restype                       = ctypes.c_int
+        lib.hipGetLastError.argtypes                      = []
     _hip = lib
     return _hip
 
@@ -201,6 +221,50 @@ class _HipExternalMemoryMipmappedArrayDesc(ctypes.Structure):
         ("flags",      ctypes.c_uint),
         ("numLevels",  ctypes.c_uint),
     ]
+
+
+# --- External semaphore interop (GPU-to-GPU D3D11 fence) -------------------
+
+class _HipExternalSemaphoreHandleDesc(ctypes.Structure):
+    _fields_ = [
+        ("type",     ctypes.c_int),
+        ("handle",   _HipHandleUnion),
+        ("flags",    ctypes.c_uint),
+        ("reserved", ctypes.c_uint * 16),
+    ]
+
+
+class _HipExtSemWaitParams(ctypes.Structure):
+    class _Params(ctypes.Structure):
+        class _Fence(ctypes.Structure):
+            _fields_ = [("value", ctypes.c_ulonglong)]
+
+        class _NvSciSync(ctypes.Union):
+            _fields_ = [("fence", ctypes.c_void_p), ("reserved", ctypes.c_ulonglong)]
+
+        class _KeyedMutex(ctypes.Structure):
+            _fields_ = [("key", ctypes.c_ulonglong)]
+
+        _fields_ = [
+            ("fence",     _Fence),
+            ("nvSciSync", _NvSciSync),
+            ("keyedMutex", _KeyedMutex),
+            ("reserved",  ctypes.c_uint * 10),
+        ]
+
+    _fields_ = [
+        ("params",   _Params),
+        ("flags",    ctypes.c_uint),
+        ("reserved", ctypes.c_uint * 16),
+    ]
+
+
+# HIP external-semaphore handle type for a shared D3D11/D3D12 fence NT handle.
+# AMD's ROCm runtime imports the D3D11 fence's shared NT handle under the
+# D3D12Fence type (4); the dedicated D3D11Fence type (5) is rejected. The two
+# fence objects are interop-compatible (same monotonic timeline), so type 4 is
+# the correct, working choice on AMD.
+_HIP_EXT_SEM_D3D_FENCE = 4
 
 # BGRA8 = 4 × 8-bit unsigned channels
 _BGRA8_FORMAT = _HipChannelFormatDesc(8, 8, 8, 8, 1)  # kind=1 → unsigned
@@ -271,9 +335,8 @@ class _HipD3D11Bridge:
         self._bufs = [ctypes.c_void_p(t.data_ptr()) for t in self._tensors]
         self._idx  = 0
 
-    def update(self, stream, device_id: int) -> torch.Tensor:
-        """Async DMA into the current buffer, synchronize, then swap buffers."""
-        self._hip.hipSetDevice(device_id)
+    def update(self, stream, synchronize: bool = False) -> torch.Tensor:
+        """Async DMA into the current buffer and optionally synchronize stream."""
         err = self._hip.hipMemcpy2DFromArrayAsync(
             self._bufs[self._idx], self.width * 4,
             self._level0, 0, 0, self.width * 4, self.height,
@@ -281,7 +344,8 @@ class _HipD3D11Bridge:
         )
         if err != 0:
             raise RuntimeError(f"hipMemcpy2DFromArrayAsync failed: {err}")
-        stream.synchronize()
+        if synchronize:
+            stream.synchronize()
         tensor = self._tensors[self._idx]
         self._idx ^= 1  # swap to the other buffer for next frame
         return tensor
@@ -292,6 +356,60 @@ class _HipD3D11Bridge:
                 self._hip.hipFreeMipmappedArray(self._mip_array)
             if getattr(self, "_ext_mem", None) and self._ext_mem.value:
                 self._hip.hipDestroyExternalMemory(self._ext_mem)
+        except Exception:
+            pass
+
+
+class _GpuFenceUnsupported(Exception):
+    """Raised when the HIP runtime cannot import the D3D11 shared fence."""
+
+
+class _HipExternalSemaphore:
+    """Imports a shared D3D11 fence (NT handle) as a HIP external semaphore so
+    the HIP stream can wait on GPU copy completion without any CPU busy-wait."""
+
+    def __init__(self, fence_handle_int: int, device_id: int):
+        self._hip = _get_hip()
+        self._hip.hipSetDevice(device_id)
+
+        if not hasattr(self._hip, "hipImportExternalSemaphore"):
+            raise _GpuFenceUnsupported("HIP runtime lacks external-semaphore support")
+        if not fence_handle_int:
+            raise _GpuFenceUnsupported("fence handle is NULL")
+
+        desc = _HipExternalSemaphoreHandleDesc()
+        desc.type                = _HIP_EXT_SEM_D3D_FENCE
+        desc.handle.win32.handle = ctypes.c_void_p(fence_handle_int)
+        desc.handle.win32.name   = None
+        desc.flags               = 0
+
+        self._sem = ctypes.c_void_p()
+        err = self._hip.hipImportExternalSemaphore(ctypes.byref(self._sem), ctypes.byref(desc))
+        if err != 0:
+            self._sem = ctypes.c_void_p()
+            # Clear the sticky HIP error so a subsequent fallback (or torch
+            # allocation) doesn't inherit it.
+            if hasattr(self._hip, "hipGetLastError"):
+                self._hip.hipGetLastError()
+            raise _GpuFenceUnsupported(f"hipImportExternalSemaphore failed: {err}")
+
+        # Reusable wait-params; only the fence value changes per frame.
+        self._wait = _HipExtSemWaitParams()
+
+    def wait(self, fence_value: int, stream) -> None:
+        """Enqueue a GPU-side wait until the fence reaches fence_value."""
+        self._wait.params.fence.value = fence_value
+        err = self._hip.hipWaitExternalSemaphoresAsync(
+            ctypes.byref(self._sem), ctypes.byref(self._wait), 1,
+            ctypes.c_void_p(stream.cuda_stream),
+        )
+        if err != 0:
+            raise RuntimeError(f"hipWaitExternalSemaphoresAsync failed: {err}")
+
+    def __del__(self):
+        try:
+            if getattr(self, "_sem", None) and self._sem.value:
+                self._hip.hipDestroyExternalSemaphore(self._sem)
         except Exception:
             pass
 
@@ -349,17 +467,22 @@ class WindowsCapture:
         window_name: Optional[str] = None,
         window_hwnd: Optional[int] = None,
         device_id: int = 0,
+        synchronize_copy: bool = False,
+        use_gpu_fence: bool = True,
     ):
         self.device_id = device_id
+        self.synchronize_copy = synchronize_copy
+        self.use_gpu_fence = use_gpu_fence
+        self._monitor_index = monitor_index
+        self._window_name = window_name
+        self._window_hwnd = window_hwnd
         try:
             luid = get_luid(device_id)
         except Exception:
             luid = None
 
-        self._inner         = _NativeWcCapture(
-            luid=luid, monitor_index=monitor_index,
-            window_hwnd=window_hwnd, window_title=window_name,
-        )
+        self._luid = luid
+        self._inner = self._make_inner(use_gpu_fence)
         self.frame_handler  = None
         self.closed_handler = None
         self._bridges: list  = [None, None]
@@ -369,6 +492,14 @@ class WindowsCapture:
         self._control       = InternalCaptureControl(self)
         self._last_id       = 0
         self._stream        = None
+        self._semaphore     = None
+
+    def _make_inner(self, use_gpu_fence: bool):
+        return _NativeWcCapture(
+            luid=self._luid, monitor_index=self._monitor_index,
+            window_hwnd=self._window_hwnd, window_title=self._window_name,
+            use_gpu_fence=use_gpu_fence,
+        )
 
     def event(self, handler):
         if handler.__name__ == "on_frame_arrived":
@@ -382,12 +513,30 @@ class WindowsCapture:
         if not self.frame_handler:
             raise RuntimeError("on_frame_arrived handler not set")
 
-        self._stream   = torch.cuda.Stream(device=self.device_id)
+        self._stream   = torch.cuda.current_stream(self.device_id)
+        try:
+            self._capture_loop()
+        except _GpuFenceUnsupported:
+            # The HIP runtime can't import the D3D11 shared fence on this
+            # system. Transparently fall back to the legacy CPU-wait path and
+            # retry once so capture still works correctly.
+            if not self.use_gpu_fence:
+                raise
+            self.use_gpu_fence = False
+            self._semaphore = None
+            self._inner = self._make_inner(False)
+            self._capture_loop()
+        finally:
+            if self.closed_handler:
+                self.closed_handler()
+
+    def _capture_loop(self):
         self._inner.start()
         self._running  = True
         self._last_id  = 0
         self._bridges  = [None, None]
         self._last_wh  = (0, 0)
+        self._semaphore = None
 
         t0 = time.time()
         while not self._inner.is_alive() and time.time() - t0 < 1.0:
@@ -424,13 +573,22 @@ class WindowsCapture:
                         gpu_frame.shared_handle, w, h, self.device_id
                     )
 
-                tensor = self._bridges[buf_idx].update(self._stream, self.device_id)
+                # GPU-to-GPU fence: enqueue a stream wait for the D3D11 copy to
+                # finish before the DMA reads the shared texture — no CPU spin.
+                if self.use_gpu_fence and gpu_frame.fence_value:
+                    if self._semaphore is None:
+                        self._semaphore = _HipExternalSemaphore(
+                            gpu_frame.fence_handle, self.device_id
+                        )
+                    self._semaphore.wait(gpu_frame.fence_value, self._stream)
+
+                tensor = self._bridges[buf_idx].update(
+                    self._stream, synchronize=self.synchronize_copy
+                )
                 self.frame_handler(Frame(tensor[:oh, :ow], ow, oh), self._control)
 
         finally:
             self.stop()
-            if self.closed_handler:
-                self.closed_handler()
 
     def start_free_threaded(self):
         """Start capture on a background daemon thread."""

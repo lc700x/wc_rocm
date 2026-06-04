@@ -9,10 +9,11 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Foundation::{LPARAM, LUID, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_QUERY_DESC,
-    D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Asynchronous, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FENCE_FLAG_SHARED,
+    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Asynchronous,
+    ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence,
+    ID3D11Query, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -23,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_QUIT,
 };
 use windows::core::Interface;
+use windows::core::PCWSTR;
 
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -116,6 +118,14 @@ pub struct WcGpuFrame {
     pub original_height: u32,
     #[pyo3(get)]
     pub buf_idx: usize,
+    /// Monotonic D3D11 fence value signaled after the GPU copy completes.
+    /// 0 when GPU-fence mode is disabled (legacy CPU-wait path).
+    #[pyo3(get)]
+    pub fence_value: u64,
+    /// Shared NT handle for the D3D11 fence (constant for the session).
+    /// 0 when GPU-fence mode is disabled.
+    #[pyo3(get)]
+    pub fence_handle: usize,
 }
 
 #[pymethods]
@@ -157,16 +167,38 @@ struct InnerHandler {
     current_aligned_width: u32,
     current_aligned_height: u32,
     thread_id: u32,
+    // GPU-to-GPU sync: signal a shared D3D11 fence after the copy so the HIP
+    // stream can wait on it without any CPU busy-wait.
+    use_gpu_fence: bool,
+    fence: Option<ID3D11Fence>,
+    fence_shared_handle: usize,
+    fence_value: u64,
 }
 
 impl GraphicsCaptureApiHandler for InnerHandler {
-    type Flags = (Arc<FrameSlot>, u32);
+    type Flags = (Arc<FrameSlot>, u32, bool);
     type Error = WcCudaError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         let query_desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
         let mut query: Option<ID3D11Query> = None;
         unsafe { ctx.device.CreateQuery(&query_desc, Some(&mut query))? };
+
+        let use_gpu_fence = ctx.flags.2;
+        let (fence, fence_shared_handle) = if use_gpu_fence {
+            // ID3D11Device5 + ID3D11Fence require Windows 10. Create a shared
+            // fence and export an NT handle Python can import into HIP.
+            let device5: ID3D11Device5 = ctx.device.cast()?;
+            let mut fence_opt: Option<ID3D11Fence> = None;
+            unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_opt)? };
+            let fence = fence_opt.unwrap();
+            // GENERIC_ALL (0x10000000) access for the shared handle.
+            let handle = unsafe { fence.CreateSharedHandle(None, 0x10000000, PCWSTR::null())? };
+            (Some(fence), handle.0 as usize)
+        } else {
+            (None, 0usize)
+        };
+
         Ok(Self {
             shared_slot: ctx.flags.0,
             thread_id: ctx.flags.1,
@@ -175,6 +207,10 @@ impl GraphicsCaptureApiHandler for InnerHandler {
             write_idx: 0,
             current_aligned_width: 0,
             current_aligned_height: 0,
+            use_gpu_fence,
+            fence,
+            fence_shared_handle,
+            fence_value: 0,
         })
     }
 
@@ -226,38 +262,62 @@ impl GraphicsCaptureApiHandler for InnerHandler {
             let tex = tex.clone();
             unsafe {
                 context.CopySubresourceRegion(&tex, 0, 0, 0, 0, frame.as_raw_texture(), 0, None);
-                context.Flush();
             }
 
-            // Race 1 fix: wait for GPU to finish the copy before signaling Python.
-            // Flush() only submits — without this fence Python's HIP DMA can read
-            // a partially-written texture.
-            let async_query: ID3D11Asynchronous = self.event_query.cast()?;
-            unsafe { context.End(&async_query); }
-            // GetData's safe wrapper returns Result<()> and folds S_FALSE into Ok(()),
-            // so call the vtable directly to distinguish "done" (S_OK=0) from
-            // "not yet" (S_FALSE=1).
-            // ID3D11Asynchronous vtable: QI=0, AddRef=1, Release=2, GetDevice=3,
-            // GetPrivateData=4, SetPrivateData=5, SetPrivateDataInterface=6,
-            // GetType=7, Begin=8, End=9, GetData=10, SetPredication=11.
-            // GetData's safe wrapper returns Result<()> and folds S_FALSE into Ok(()),
-            // so we detect completion via the output value: for D3D11_QUERY_EVENT,
-            // the GPU writes 0 (not done) or 1 (done) into the BOOL output.
-            let mut done: u32 = 0;
-            loop {
-                let _ = unsafe {
-                    context.GetData(
-                        &async_query,
-                        Some((&mut done as *mut u32).cast()),
-                        4,
-                        1, // D3D11_ASYNC_GETDATA_DONOTFLUSH — already flushed above
-                    )
-                };
-                if done != 0 {
-                    break;
+            let (fence_value, fence_handle) = if self.use_gpu_fence {
+                // GPU-to-GPU path: enqueue a fence signal after the copy and
+                // submit. No CPU wait — Python's HIP stream waits on this fence
+                // value before its DMA, so ordering is enforced entirely on the
+                // GPU. This frees a CPU core and returns to WGC immediately.
+                self.fence_value += 1;
+                let value = self.fence_value;
+                let ctx4: ID3D11DeviceContext4 = context.cast()?;
+                let fence = self.fence.as_ref().unwrap();
+                unsafe {
+                    ctx4.Signal(fence, value)?;
+                    context.Flush();
                 }
-                std::hint::spin_loop();
-            }
+                (value, self.fence_shared_handle)
+            } else {
+                // Legacy path: flush then CPU busy-wait on an event query until
+                // the copy is done before signaling Python.
+                unsafe {
+                    context.Flush();
+                }
+
+                // Race 1 fix: wait for GPU to finish the copy before signaling Python.
+                // Flush() only submits — without this fence Python's HIP DMA can read
+                // a partially-written texture.
+                let async_query: ID3D11Asynchronous = self.event_query.cast()?;
+                unsafe {
+                    context.End(&async_query);
+                }
+                // GetData's safe wrapper returns Result<()> and folds S_FALSE into Ok(()),
+                // so we detect completion via the output value: for D3D11_QUERY_EVENT,
+                // the GPU writes 0 (not done) or 1 (done) into the BOOL output.
+                let mut done: u32 = 0;
+                let mut spins: u32 = 0;
+                loop {
+                    let _ = unsafe {
+                        context.GetData(
+                            &async_query,
+                            Some((&mut done as *mut u32).cast()),
+                            4,
+                            1, // D3D11_ASYNC_GETDATA_DONOTFLUSH — already flushed above
+                        )
+                    };
+                    if done != 0 {
+                        break;
+                    }
+                    spins += 1;
+                    if spins < 64 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                (0u64, 0usize)
+            };
 
             let buf_idx = self.write_idx;
             let gpu_frame = WcGpuFrame {
@@ -267,12 +327,14 @@ impl GraphicsCaptureApiHandler for InnerHandler {
                 original_width: width,
                 original_height: height,
                 buf_idx,
+                fence_value,
+                fence_handle,
             };
 
             let mut data = self.shared_slot.data.lock();
             data.0 = Some(gpu_frame);
             data.1 += 1;
-            self.shared_slot.condvar.notify_all();
+            self.shared_slot.condvar.notify_one();
 
             // Race 2 fix: advance write_idx AFTER signaling so the next frame
             // writes into the other texture while Python reads this one.
@@ -295,6 +357,7 @@ pub struct WcCapture {
     monitor_index: Option<usize>,
     window_hwnd: Option<isize>,
     window_title: Option<String>,
+    use_gpu_fence: bool,
     shared_slot: Arc<FrameSlot>,
     thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
     thread_id: Arc<Mutex<Option<u32>>>,
@@ -305,18 +368,20 @@ pub struct WcCapture {
 #[pymethods]
 impl WcCapture {
     #[new]
-    #[pyo3(signature = (luid=None, monitor_index=None, window_hwnd=None, window_title=None))]
+    #[pyo3(signature = (luid=None, monitor_index=None, window_hwnd=None, window_title=None, use_gpu_fence=true))]
     fn new(
         luid: Option<(u32, i32)>,
         monitor_index: Option<usize>,
         window_hwnd: Option<isize>,
         window_title: Option<String>,
+        use_gpu_fence: bool,
     ) -> Self {
         Self {
             luid,
             monitor_index,
             window_hwnd,
             window_title,
+            use_gpu_fence,
             shared_slot: Arc::new(FrameSlot {
                 data: Mutex::new((None, 0)),
                 condvar: Condvar::new(),
@@ -343,6 +408,7 @@ impl WcCapture {
         let monitor_index = self.monitor_index;
         let window_hwnd = self.window_hwnd;
         let window_title = self.window_title.clone();
+        let use_gpu_fence = self.use_gpu_fence;
         let thread_id_ptr = self.thread_id.clone();
         let should_stop = self.should_stop.clone();
         let last_error = self.last_error.clone();
@@ -390,7 +456,7 @@ impl WcCapture {
                 }
 
                 let ctx = Context {
-                    flags: (shared_slot, tid),
+                    flags: (shared_slot, tid, use_gpu_fence),
                     device: d3d_device.clone(),
                     device_context: d3d_device_context.clone(),
                 };
