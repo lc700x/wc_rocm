@@ -1,10 +1,10 @@
 [package]
-name = "wc_rocm"
+name = "wc_xpu"
 version = "0.1.3"
 edition = "2024"
 
 [lib]
-name = "_wc_rocm"
+name = "_wc_xpu"
 crate-type = ["cdylib"]
 
 [dependencies]

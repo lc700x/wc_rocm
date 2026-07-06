@@ -1,4 +1,4 @@
-from wc_rocm import WindowsCapture, list_windows
+from wc_xpu import WindowsCapture, list_windows
 from PIL import Image
 
 

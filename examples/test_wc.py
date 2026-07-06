@@ -1,4 +1,4 @@
-from wc_rocm import WindowsCapture, Frame, InternalCaptureControl
+from wc_xpu import WindowsCapture, Frame, InternalCaptureControl
 import time
 import cv2
 

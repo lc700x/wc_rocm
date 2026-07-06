@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence,
     ID3D11Query, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIResource};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
@@ -37,7 +37,7 @@ use windows_capture::settings::{
 use windows_capture::window::Window;
 
 #[derive(thiserror::Error, Debug)]
-pub enum WcCudaError {
+pub enum WcXpuError {
     #[error("Windows API error: {0}")]
     Windows(#[from] windows::core::Error),
     #[error("AdapterNotFound")]
@@ -50,15 +50,15 @@ pub enum WcCudaError {
     ItemConvertFailed,
 }
 
-impl From<WcCudaError> for PyErr {
-    fn from(err: WcCudaError) -> PyErr {
+impl From<WcXpuError> for PyErr {
+    fn from(err: WcXpuError) -> PyErr {
         pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
     }
 }
 
 pub fn create_d3d_device_with_luid(
     luid: Option<LUID>,
-) -> Result<(ID3D11Device, ID3D11DeviceContext), WcCudaError> {
+) -> Result<(ID3D11Device, ID3D11DeviceContext), WcXpuError> {
     let adapter = if let Some(luid) = luid {
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
         let mut adapter = None;
@@ -77,7 +77,7 @@ pub fn create_d3d_device_with_luid(
             }
             i += 1;
         }
-        adapter.ok_or(WcCudaError::AdapterNotFound)?
+        adapter.ok_or(WcXpuError::AdapterNotFound)?
     } else {
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
         unsafe { factory.EnumAdapters1(0)? }
@@ -118,14 +118,17 @@ pub struct WcGpuFrame {
     pub original_height: u32,
     #[pyo3(get)]
     pub buf_idx: usize,
-    /// Monotonic D3D11 fence value signaled after the GPU copy completes.
-    /// 0 when GPU-fence mode is disabled (legacy CPU-wait path).
     #[pyo3(get)]
     pub fence_value: u64,
-    /// Shared NT handle for the D3D11 fence (constant for the session).
-    /// 0 when GPU-fence mode is disabled.
     #[pyo3(get)]
     pub fence_handle: usize,
+    /// DXGI shared (KMT) handle for the D3D11 texture.
+    #[pyo3(get)]
+    pub shared_handle: usize,
+    /// Cached raw pixel data (BGRA8). Computed on the capture thread to avoid
+    /// thread-affinity issues with D3D11 device/context.
+    #[pyo3(get)]
+    pub pixel_data: Vec<u8>,
 }
 
 #[pymethods]
@@ -136,11 +139,8 @@ impl WcGpuFrame {
     }
 
     /// Win32 shared handle (HANDLE) obtained via IDXGIResource::GetSharedHandle.
-    /// Returns 0 if the texture does not have the SHARED misc flag.
     #[getter]
     fn shared_handle(&self) -> usize {
-        use windows::core::Interface;
-        use windows::Win32::Graphics::Dxgi::IDXGIResource;
         unsafe {
             let dxgi_res: IDXGIResource = match self.texture.cast() {
                 Ok(r) => r,
@@ -167,8 +167,6 @@ struct InnerHandler {
     current_aligned_width: u32,
     current_aligned_height: u32,
     thread_id: u32,
-    // GPU-to-GPU sync: signal a shared D3D11 fence after the copy so the HIP
-    // stream can wait on it without any CPU busy-wait.
     use_gpu_fence: bool,
     fence: Option<ID3D11Fence>,
     fence_shared_handle: usize,
@@ -177,7 +175,7 @@ struct InnerHandler {
 
 impl GraphicsCaptureApiHandler for InnerHandler {
     type Flags = (Arc<FrameSlot>, u32, bool);
-    type Error = WcCudaError;
+    type Error = WcXpuError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         let query_desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
@@ -186,13 +184,10 @@ impl GraphicsCaptureApiHandler for InnerHandler {
 
         let use_gpu_fence = ctx.flags.2;
         let (fence, fence_shared_handle) = if use_gpu_fence {
-            // ID3D11Device5 + ID3D11Fence require Windows 10. Create a shared
-            // fence and export an NT handle Python can import into HIP.
             let device5: ID3D11Device5 = ctx.device.cast()?;
             let mut fence_opt: Option<ID3D11Fence> = None;
             unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_opt)? };
             let fence = fence_opt.unwrap();
-            // GENERIC_ALL (0x10000000) access for the shared handle.
             let handle = unsafe { fence.CreateSharedHandle(None, 0x10000000, PCWSTR::null())? };
             (Some(fence), handle.0 as usize)
         } else {
@@ -253,6 +248,7 @@ impl GraphicsCaptureApiHandler for InnerHandler {
                 unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex))? };
                 *slot = Some(tex.unwrap());
             }
+
             self.current_aligned_width = aligned_width;
             self.current_aligned_height = aligned_height;
             self.write_idx = 0;
@@ -265,10 +261,6 @@ impl GraphicsCaptureApiHandler for InnerHandler {
             }
 
             let (fence_value, fence_handle) = if self.use_gpu_fence {
-                // GPU-to-GPU path: enqueue a fence signal after the copy and
-                // submit. No CPU wait — Python's HIP stream waits on this fence
-                // value before its DMA, so ordering is enforced entirely on the
-                // GPU. This frees a CPU core and returns to WGC immediately.
                 self.fence_value += 1;
                 let value = self.fence_value;
                 let ctx4: ID3D11DeviceContext4 = context.cast()?;
@@ -279,22 +271,13 @@ impl GraphicsCaptureApiHandler for InnerHandler {
                 }
                 (value, self.fence_shared_handle)
             } else {
-                // Legacy path: flush then CPU busy-wait on an event query until
-                // the copy is done before signaling Python.
                 unsafe {
                     context.Flush();
                 }
-
-                // Race 1 fix: wait for GPU to finish the copy before signaling Python.
-                // Flush() only submits — without this fence Python's HIP DMA can read
-                // a partially-written texture.
                 let async_query: ID3D11Asynchronous = self.event_query.cast()?;
                 unsafe {
                     context.End(&async_query);
                 }
-                // GetData's safe wrapper returns Result<()> and folds S_FALSE into Ok(()),
-                // so we detect completion via the output value: for D3D11_QUERY_EVENT,
-                // the GPU writes 0 (not done) or 1 (done) into the BOOL output.
                 let mut done: u32 = 0;
                 let mut spins: u32 = 0;
                 loop {
@@ -303,7 +286,7 @@ impl GraphicsCaptureApiHandler for InnerHandler {
                             &async_query,
                             Some((&mut done as *mut u32).cast()),
                             4,
-                            1, // D3D11_ASYNC_GETDATA_DONOTFLUSH — already flushed above
+                            1,
                         )
                     };
                     if done != 0 {
@@ -320,6 +303,22 @@ impl GraphicsCaptureApiHandler for InnerHandler {
             };
 
             let buf_idx = self.write_idx;
+
+            // Get the DXGI shared handle (KMT handle) for GPU interop
+            let shared_handle = unsafe {
+                let dxgi_res: IDXGIResource = match tex.cast() {
+                    Ok(r) => r,
+                    Err(_) => return Ok(()),
+                };
+                match dxgi_res.GetSharedHandle() {
+                    Ok(h) => h.0 as usize,
+                    Err(_) => 0,
+                }
+            };
+
+            // Get CPU-accessible pixel data from the WGC frame buffer
+            let pixel_data = frame.buffer().map(|mut fb| fb.as_raw_buffer().to_vec()).unwrap_or_default();
+
             let gpu_frame = WcGpuFrame {
                 texture: tex,
                 width: aligned_width,
@@ -329,15 +328,19 @@ impl GraphicsCaptureApiHandler for InnerHandler {
                 buf_idx,
                 fence_value,
                 fence_handle,
+                shared_handle,
+                pixel_data,
             };
+
+            // Update the frame with pixel data (already set in gpu_frame above)
+            let slot_data = self.shared_slot.data.lock();
+            drop(slot_data);
 
             let mut data = self.shared_slot.data.lock();
             data.0 = Some(gpu_frame);
             data.1 += 1;
             self.shared_slot.condvar.notify_one();
 
-            // Race 2 fix: advance write_idx AFTER signaling so the next frame
-            // writes into the other texture while Python reads this one.
             self.write_idx = 1 - self.write_idx;
         }
         Ok(())
@@ -418,7 +421,7 @@ impl WcCapture {
         *last_error.lock() = None;
 
         let handle = thread::spawn(move || {
-            let res: Result<(), WcCudaError> = (|| {
+            let res: Result<(), WcXpuError> = (|| {
                 if should_stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -427,19 +430,19 @@ impl WcCapture {
 
                 let item_type: GraphicsCaptureItemType = if let Some(title) = window_title {
                     Window::from_contains_name(&title)
-                        .map_err(|_| WcCudaError::Capture(format!("Window not found: {}", title)))?
+                        .map_err(|_| WcXpuError::Capture(format!("Window not found: {}", title)))?
                         .try_into()
-                        .map_err(|_| WcCudaError::ItemConvertFailed)?
+                        .map_err(|_| WcXpuError::ItemConvertFailed)?
                 } else if let Some(hwnd) = window_hwnd {
                     Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void)
                         .try_into()
-                        .map_err(|_| WcCudaError::ItemConvertFailed)?
+                        .map_err(|_| WcXpuError::ItemConvertFailed)?
                 } else {
                     let idx = monitor_index.unwrap_or(1);
                     Monitor::from_index(idx)
-                        .map_err(|_| WcCudaError::ItemConvertFailed)?
+                        .map_err(|_| WcXpuError::ItemConvertFailed)?
                         .try_into()
-                        .map_err(|_| WcCudaError::ItemConvertFailed)?
+                        .map_err(|_| WcXpuError::ItemConvertFailed)?
                 };
 
                 let options = DispatcherQueueOptions {
@@ -478,11 +481,11 @@ impl WcCapture {
                     tid,
                     result,
                 )
-                .map_err(|e| WcCudaError::Capture(e.to_string()))?;
+                .map_err(|e| WcXpuError::Capture(e.to_string()))?;
 
                 capture
                     .start_capture()
-                    .map_err(|e| WcCudaError::Capture(e.to_string()))?;
+                    .map_err(|e| WcXpuError::Capture(e.to_string()))?;
 
                 let mut message = MSG::default();
                 unsafe {
@@ -493,7 +496,7 @@ impl WcCapture {
                 }
                 Ok(())
             })();
-            
+
             if let Err(e) = res {
                 *last_error.lock() = Some(e.to_string());
             }
@@ -540,7 +543,7 @@ impl WcCapture {
                 let dur = Duration::from_secs_f32(timeout.unwrap());
                 let _ = slot.condvar.wait_for(&mut data, dur);
             }
-            
+
             if data.1 > last_id {
                 data.0.as_ref().map(|f| (f.clone(), data.1))
             } else {
@@ -551,7 +554,7 @@ impl WcCapture {
 }
 
 #[pymodule]
-fn _wc_rocm(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _wc_xpu(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WcCapture>()?;
     m.add_class::<WcGpuFrame>()?;
     Ok(())
